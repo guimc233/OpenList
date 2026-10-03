@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -36,6 +37,13 @@ func (d *Wopan) Init(ctx context.Context) error {
 		d.RefreshToken = refreshToken
 		op.MustSaveDriverStorage(d)
 	})
+
+	// 关键：InitZoneURL() 在 ZoneURL 非空时直接 return，
+	// Upload2C 也优先使用 w.ZoneURL，因此必须在 InitData() 之前赋值。
+	if d.UploadZoneURL != "" {
+		d.client.ZoneURL = strings.TrimRight(strings.TrimSpace(d.UploadZoneURL), "/")
+	}
+
 	fml, err := d.client.FamilyUserCurrentEncode()
 	if err != nil {
 		return err
@@ -152,18 +160,7 @@ func (d *Wopan) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Wopan) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	_, err := d.client.Upload2C(d.getSpaceType(), wopan.Upload2CFile{
-		Name:        stream.GetName(),
-		Size:        stream.GetSize(),
-		Content:     driver.NewLimitedUploadStream(ctx, stream),
-		ContentType: stream.GetMimetype(),
-	}, dstDir.GetID(), d.FamilyID, wopan.Upload2COption{
-		OnProgress: func(current, total int64) {
-			up(100 * float64(current) / float64(total))
-		},
-		Ctx: ctx,
-	})
-	return err
+	return d.putParallel(ctx, dstDir, stream, up)
 }
 
 func (d *Wopan) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
