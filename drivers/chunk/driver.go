@@ -45,6 +45,9 @@ func (d *Chunk) Init(ctx context.Context) error {
 	if len(d.ChunkPrefix) <= 0 {
 		return errors.New("chunk folder prefix must not be empty")
 	}
+	if d.NumUploadWorkers < 1 {
+		d.NumUploadWorkers = 1
+	}
 	d.RemotePath = utils.FixAndCleanPath(d.RemotePath)
 	return nil
 }
@@ -467,10 +470,6 @@ func (d *Chunk) Put(ctx context.Context, dstDir model.Obj, file model.FileStream
 	if (d.Thumbnail && dstDir.GetName() == ".thumbnails") || (d.ChunkLargeFileOnly && file.GetSize() <= d.PartSize) {
 		return op.Put(ctx, remoteStorage, stdpath.Join(remoteActualPath, dstDir.GetPath()), file, up)
 	}
-	upReader := &driver.ReaderUpdatingProgress{
-		Reader:         file,
-		UpdateProgress: up,
-	}
 	dst := stdpath.Join(remoteActualPath, dstDir.GetPath(), d.ChunkPrefix+file.GetName())
 	skipHookCtx := context.WithValue(ctx, conf.SkipHookKey, struct{}{})
 	if d.StoreHash {
@@ -486,37 +485,105 @@ func (d *Chunk) Put(ctx context.Context, dstDir model.Obj, file model.FileStream
 			}, nil)
 		}
 	}
-	fullPartCount := int(file.GetSize() / d.PartSize)
-	tailSize := file.GetSize() % d.PartSize
-	if tailSize == 0 && fullPartCount > 0 {
-		fullPartCount--
-		tailSize = d.PartSize
+	parts := planParts(file.GetSize(), d.PartSize)
+	tail := parts[len(parts)-1]
+	fullParts := parts[:len(parts)-1]
+	if d.NumUploadWorkers > 1 && len(fullParts) > 0 {
+		return d.putPartsConcurrent(ctx, skipHookCtx, remoteStorage, dst, file, up, fullParts, tail)
 	}
-	partIndex := 0
-	for partIndex < fullPartCount {
-		err = op.Put(skipHookCtx, remoteStorage, dst, &stream.FileStream{
+	return d.putPartsSequential(ctx, skipHookCtx, remoteStorage, dst, file, up, fullParts, tail)
+}
+
+// putPartsSequential 顺序上传各分片：直接顺序消费源流，不需要把整个文件落盘。
+func (d *Chunk) putPartsSequential(ctx, skipHookCtx context.Context, remoteStorage driver.Driver, dst string, file model.FileStreamer, up driver.UpdateProgress, fullParts []chunkPart, tail chunkPart) error {
+	upReader := &driver.ReaderUpdatingProgress{
+		Reader:         file,
+		UpdateProgress: up,
+	}
+	for _, part := range fullParts {
+		err := op.Put(skipHookCtx, remoteStorage, dst, &stream.FileStream{
 			Obj: &model.Object{
-				Name:     d.getPartName(partIndex),
-				Size:     d.PartSize,
+				Name:     d.getPartName(part.index),
+				Size:     part.size,
 				Modified: file.ModTime(),
 			},
 			Mimetype: file.GetMimetype(),
-			Reader:   io.LimitReader(upReader, d.PartSize),
+			Reader:   io.LimitReader(upReader, part.size),
 		}, nil)
 		if err != nil {
 			_ = op.Remove(ctx, remoteStorage, dst)
 			return err
 		}
-		partIndex++
 	}
-	err = op.Put(ctx, remoteStorage, dst, &stream.FileStream{
+	err := op.Put(ctx, remoteStorage, dst, &stream.FileStream{
 		Obj: &model.Object{
-			Name:     d.getPartName(fullPartCount),
-			Size:     tailSize,
+			Name:     d.getPartName(tail.index),
+			Size:     tail.size,
 			Modified: file.ModTime(),
 		},
 		Mimetype: file.GetMimetype(),
 		Reader:   upReader,
+	}, nil)
+	if err != nil {
+		_ = op.Remove(ctx, remoteStorage, dst)
+	}
+	return err
+}
+
+// putPartsConcurrent 并发上传前置分片，最后一片在其余分片全部完成后单独上传，
+// 以保持"最后一片触发对象更新钩子"的既有语义。
+func (d *Chunk) putPartsConcurrent(ctx, skipHookCtx context.Context, remoteStorage driver.Driver, dst string, file model.FileStreamer, up driver.UpdateProgress, fullParts []chunkPart, tail chunkPart) error {
+	// 并发分片各自需要独立窗口，源必须是可随机访问的；
+	// 普通上传流会先整体落到本地临时文件（由 FileStream 的 Closer 负责清理）。
+	src := file.GetFile()
+	if src == nil {
+		// CacheFullAndWriter 按指针判空，nil 回调必须传 nil 指针而不是 &up
+		var upPtr *model.UpdateProgress
+		if up != nil {
+			upPtr = &up
+		}
+		cached, err := file.CacheFullAndWriter(upPtr, nil)
+		if err != nil {
+			return fmt.Errorf("failed to cache source stream for concurrent chunk upload: %w", err)
+		}
+		src = cached
+	}
+	report := newPartProgress(file.GetSize(), up)
+
+	workers := d.NumUploadWorkers
+	if workers > len(fullParts) {
+		workers = len(fullParts)
+	}
+	g, gCtx := errgroup.NewGroupWithContext(skipHookCtx, workers, retry.Attempts(3))
+	for _, part := range fullParts {
+		if utils.IsCanceled(gCtx) {
+			break
+		}
+		g.Go(func(ctx context.Context) error {
+			// FileStream 在闭包内构造，重试时会得到全新的分片窗口
+			return op.Put(ctx, remoteStorage, dst, &stream.FileStream{
+				Obj: &model.Object{
+					Name:     d.getPartName(part.index),
+					Size:     part.size,
+					Modified: file.ModTime(),
+				},
+				Mimetype: file.GetMimetype(),
+				Reader:   newPartReader(src, part, report),
+			}, nil)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		_ = op.Remove(ctx, remoteStorage, dst)
+		return err
+	}
+	err := op.Put(ctx, remoteStorage, dst, &stream.FileStream{
+		Obj: &model.Object{
+			Name:     d.getPartName(tail.index),
+			Size:     tail.size,
+			Modified: file.ModTime(),
+		},
+		Mimetype: file.GetMimetype(),
+		Reader:   newPartReader(src, tail, report),
 	}, nil)
 	if err != nil {
 		_ = op.Remove(ctx, remoteStorage, dst)
