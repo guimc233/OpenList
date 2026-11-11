@@ -3,14 +3,18 @@ package handles
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"image/png"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/OpenListTeam/go-cache"
 	"github.com/gin-gonic/gin"
 	"github.com/pquerna/otp/totp"
+	"gorm.io/gorm"
 )
 
 type LoginReq struct {
@@ -45,21 +49,22 @@ func loginHash(c *gin.Context, req *LoginReq) {
 	ip := c.ClientIP()
 	count, ok := model.LoginCache.Get(ip)
 	if ok && count >= model.DefaultMaxAuthRetries {
+		// 被拒时不能再续期：自动重试的客户端（如凭据失效的 Subsonic/Web 轮询）
+		// 会每来一次就刷新锁定窗口，把自己永久锁死。锁定窗口只在计数时设定。
 		common.ErrorStrResp(c, model.TooManyAttempts, 429)
-		model.LoginCache.Expire(ip, model.DefaultLockDuration)
 		return
 	}
 	// check username
 	user, err := op.GetUserByName(req.Username)
 	if err != nil {
 		common.ErrorStrResp(c, model.InvalidUsernameOrPassword, 401)
-		model.LoginCache.Set(ip, count+1)
+		model.LoginCache.Set(ip, count+1, cache.WithEx[int](model.DefaultLockDuration))
 		return
 	}
 	// validate password hash
 	if err := user.ValidatePwdStaticHash(req.Password); err != nil {
 		common.ErrorStrResp(c, model.InvalidUsernameOrPassword, 401)
-		model.LoginCache.Set(ip, count+1)
+		model.LoginCache.Set(ip, count+1, cache.WithEx[int](model.DefaultLockDuration))
 		return
 	}
 	// check 2FA
@@ -67,7 +72,7 @@ func loginHash(c *gin.Context, req *LoginReq) {
 		if !totp.Validate(req.OtpCode, user.OtpSecret) {
 			// 402 - need opt
 			common.ErrorStrResp(c, model.Invalid2FACode, 402)
-			model.LoginCache.Set(ip, count+1)
+			model.LoginCache.Set(ip, count+1, cache.WithEx[int](model.DefaultLockDuration))
 			return
 		}
 	}
@@ -111,11 +116,29 @@ func UpdateCurrent(c *gin.Context) {
 		common.ErrorStrResp(c, model.GuestCannotUpdateProfile, 403)
 		return
 	}
+	ssoID := req.SsoID
+	if req.SsoID != "" && req.SsoID != user.SsoID {
+		claims, err := parseSSOBindingToken(c, req.SsoID, ssoBindingProofPurpose)
+		if err != nil {
+			common.ErrorStrResp(c, "invalid or expired SSO binding proof", 400)
+			return
+		}
+		boundUser, err := db.GetUserBySSOID(claims.SsoID)
+		if err == nil && boundUser.ID != user.ID {
+			common.ErrorStrResp(c, "SSO account is already bound to another user", 409)
+			return
+		}
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+		ssoID = claims.SsoID
+	}
 	user.Username = req.Username
 	if req.Password != "" {
 		user.SetPassword(req.Password)
 	}
-	user.SsoID = req.SsoID
+	user.SsoID = ssoID
 	if err := op.UpdateUser(user); err != nil {
 		common.ErrorResp(c, err, 500)
 	} else {

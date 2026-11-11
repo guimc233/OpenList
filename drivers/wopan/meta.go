@@ -9,11 +9,11 @@ type Addition struct {
 	// Usually one of two
 	driver.RootID
 	// define other
-	RefreshToken string `json:"refresh_token" required:"true"`
+	RefreshToken string `json:"refresh_token" help:"Provide a refresh token or an access token (at least 16 characters)"`
 	FamilyID     string `json:"family_id" help:"Keep it empty if you want to use your personal drive"`
 	SortRule     string `json:"sort_rule" type:"select" options:"name_asc,name_desc,time_asc,time_desc,size_asc,size_desc" default:"name_asc"`
 
-	AccessToken string `json:"access_token"`
+	AccessToken string `json:"access_token" help:"Optional when a refresh token is provided; it is refreshed automatically when missing or too short"`
 
 	// 字符串字段不写 type tag（internal/op/driver.go 会默认补成 "string"）
 	UploadZoneURL string `json:"upload_zone_url" default:"" help:"强制指定上传网关（upload2C），例如 https://tjupload.pan.wo.cn 或 https://bjupload.pan.wo.cn:32443 。留空则使用服务端通过 GetZoneInfo 下发的地址。仅影响上传，不影响列表/下载。"`
